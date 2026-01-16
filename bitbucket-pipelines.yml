@@ -1,0 +1,238 @@
+image: atlassian/default-image:latest
+
+definitions:
+  services:
+    docker:
+      memory: 2048
+
+pipelines:
+  pull-requests:
+    '**':
+      - step:
+          name: Terraform Plan
+          image: atlassian/default-image:latest
+          services:
+            - docker
+          volumes:
+            - /opt/atlassian/pipelines/agent/data/id_token:/opt/atlassian/pipelines/agent/data/id_token
+
+          script:
+            - |
+              set -euo pipefail
+              # bootstrap required tools (Debian-based default image)
+              if ! command -v python3 >/dev/null 2>&1; then
+                apt-get update
+                DEBIAN_FRONTEND=noninteractive apt-get install -y python3 python3-pip curl unzip
+              fi
+              if ! python3 -m pip --version >/dev/null 2>&1; then
+                python3 -m ensurepip --upgrade || true
+                python3 -m pip install --upgrade pip
+              fi
+              if ! command -v aws >/dev/null 2>&1; then
+                python3 -m pip install --no-cache-dir awscli boto3
+              fi
+              if ! command -v terraform >/dev/null 2>&1; then
+                TF_VER="1.5.7"
+                curl -fsSL "https://releases.hashicorp.com/terraform/${TF_VER}/terraform_${TF_VER}_linux_amd64.zip" -o /tmp/terraform.zip
+                unzip -o /tmp/terraform.zip -d /usr/local/bin
+                chmod +x /usr/local/bin/terraform
+                rm -f /tmp/terraform.zip
+              fi
+              aws --version
+              export AWS_REGION=${AWS_REGION}
+              export AWS_WEB_IDENTITY_TOKEN_FILE=/opt/atlassian/pipelines/agent/data/id_token
+              export AWS_ROLE_ARN=${PIPELINE_ROLE_ARN}
+              export AWS_ROLE_SESSION_NAME=BitbucketPipelines-${BITBUCKET_BUILD_NUMBER}
+              aws sts assume-role-with-web-identity --role-arn $AWS_ROLE_ARN --role-session-name $AWS_ROLE_SESSION_NAME --web-identity-token file://$AWS_WEB_IDENTITY_TOKEN_FILE --query 'Credentials.[AccessKeyId,SecretAccessKey,SessionToken]' --output text > /tmp/credentials
+              export AWS_ACCESS_KEY_ID=$(cut -f1 /tmp/credentials)
+              export AWS_SECRET_ACCESS_KEY=$(cut -f2 /tmp/credentials)
+              export AWS_SESSION_TOKEN=$(cut -f3 /tmp/credentials)
+              terraform --version
+            - |
+              TERRAFORM_ROOT="terraform"
+              if [ -n "$TERRAFORM_ROOT" ]; then
+                echo "Changing to Terraform root directory: $TERRAFORM_ROOT"
+                cd "$TERRAFORM_ROOT"
+              fi
+            - terraform init -input=false
+            - |
+              TFVARS_FILE=$(find . -name "*.tfvars" -type f | head -1)
+              ENV="${BITBUCKET_PR_DESTINATION_BRANCH}"
+              BRANCH="${BITBUCKET_BRANCH}"
+              
+              if [ -n "$TFVARS_FILE" ]; then
+                echo "Using tfvars file: $TFVARS_FILE"
+                DETECTED_ENV=$(grep -E '^[[:space:]]*(environment|env)[[:space:]]*=' "$TFVARS_FILE" | sed 's/.*=[[:space:]]*"\([^"]*\)".*/\1/' | head -1)
+                if [ -n "$DETECTED_ENV" ]; then
+                  ENV="$DETECTED_ENV"
+                fi
+              fi
+              
+              if [ -z "$ENV" ]; then
+                ENV="$BRANCH"
+              fi
+              
+              echo "Environment: $ENV"
+              
+              if [ -n "$TFVARS_FILE" ]; then
+                terraform plan -var-file=$TFVARS_FILE -no-color
+              else
+                terraform plan -no-color
+              fi
+          oidc: true
+
+  branches:
+    main:
+      - step:
+          name: Terraform Apply
+          image: atlassian/default-image:latest
+          services:
+            - docker
+          volumes:
+            - /opt/atlassian/pipelines/agent/data/id_token:/opt/atlassian/pipelines/agent/data/id_token
+
+          script:
+            - |
+              set -euo pipefail
+              if ! command -v python3 >/dev/null 2>&1; then
+                apt-get update
+                DEBIAN_FRONTEND=noninteractive apt-get install -y python3 python3-pip curl unzip
+              fi
+              if ! python3 -m pip --version >/dev/null 2>&1; then
+                python3 -m ensurepip --upgrade || true
+                python3 -m pip install --upgrade pip
+              fi
+              if ! command -v aws >/dev/null 2>&1; then
+                python3 -m pip install --no-cache-dir awscli boto3
+              fi
+              if ! command -v terraform >/dev/null 2>&1; then
+                TF_VER="1.5.7"
+                curl -fsSL "https://releases.hashicorp.com/terraform/${TF_VER}/terraform_${TF_VER}_linux_amd64.zip" -o /tmp/terraform.zip
+                unzip -o /tmp/terraform.zip -d /usr/local/bin
+                chmod +x /usr/local/bin/terraform
+                rm -f /tmp/terraform.zip
+              fi
+              aws --version
+              export AWS_REGION=${AWS_REGION}
+              export AWS_WEB_IDENTITY_TOKEN_FILE=/opt/atlassian/pipelines/agent/data/id_token
+              export AWS_ROLE_ARN=${PIPELINE_ROLE_ARN}
+              export AWS_ROLE_SESSION_NAME=BitbucketPipelines-${BITBUCKET_BUILD_NUMBER}
+              aws sts assume-role-with-web-identity --role-arn $AWS_ROLE_ARN --role-session-name $AWS_ROLE_SESSION_NAME --web-identity-token file://$AWS_WEB_IDENTITY_TOKEN_FILE --query 'Credentials.[AccessKeyId,SecretAccessKey,SessionToken]' --output text > /tmp/credentials
+              export AWS_ACCESS_KEY_ID=$(cut -f1 /tmp/credentials)
+              export AWS_SECRET_ACCESS_KEY=$(cut -f2 /tmp/credentials)
+              export AWS_SESSION_TOKEN=$(cut -f3 /tmp/credentials)
+              terraform --version
+            - |
+              TERRAFORM_ROOT="terraform"
+              if [ -n "$TERRAFORM_ROOT" ]; then
+                echo "Changing to Terraform root directory: $TERRAFORM_ROOT"
+                cd "$TERRAFORM_ROOT"
+              fi
+            - terraform init -input=false
+            - |
+              BUCKET_NAME="$TF_STATE_BUCKET"
+              if [ -n "$BUCKET_NAME" ]; then
+                if ! aws s3 ls "s3://$BUCKET_NAME" 2>/dev/null; then
+                  if [ "$AWS_REGION" = "us-east-1" ]; then
+                    aws s3 mb "s3://$BUCKET_NAME"
+                  else
+                    aws s3 mb "s3://$BUCKET_NAME" --region "$AWS_REGION"
+                  fi
+                  aws s3api put-bucket-versioning --bucket "$BUCKET_NAME" --versioning-configuration Status=Enabled
+                fi
+              fi
+            - |
+              TFVARS_FILE=$(find . -name "*.tfvars" -type f | head -1)
+              ENV="${BITBUCKET_BRANCH}"
+              
+              if [ -n "$TFVARS_FILE" ]; then
+                DETECTED_ENV=$(grep -E '^[[:space:]]*(environment|env)[[:space:]]*=' "$TFVARS_FILE" | sed 's/.*=[[:space:]]*"\([^"]*\)".*/\1/' | head -1)
+                if [ -n "$DETECTED_ENV" ]; then
+                  ENV="$DETECTED_ENV"
+                fi
+              fi
+              
+              echo "Environment: $ENV"
+              
+              if [ -n "$TFVARS_FILE" ]; then
+                terraform plan -var-file=$TFVARS_FILE
+                terraform apply -auto-approve -var-file=$TFVARS_FILE
+              else
+                terraform plan
+                terraform apply -auto-approve
+              fi
+          oidc: true
+
+  custom:
+    destroy:
+      - variables:
+          - name: ENVIRONMENT
+          - name: CONFIRM_DESTROY
+      - step:
+          name: Terraform Destroy
+          image: atlassian/default-image:latest
+          services:
+            - docker
+          volumes:
+            - /opt/atlassian/pipelines/agent/data/id_token:/opt/atlassian/pipelines/agent/data/id_token
+          condition:
+            expression: $CONFIRM_DESTROY == "DESTROY"
+          script:
+            - |
+              set -euo pipefail
+              if ! command -v python3 >/dev/null 2>&1; then
+                apt-get update
+                DEBIAN_FRONTEND=noninteractive apt-get install -y python3 python3-pip curl unzip
+              fi
+              if ! python3 -m pip --version >/dev/null 2>&1; then
+                python3 -m ensurepip --upgrade || true
+                python3 -m pip install --upgrade pip
+              fi
+              if ! command -v aws >/dev/null 2>&1; then
+                python3 -m pip install --no-cache-dir awscli boto3
+              fi
+              if ! command -v terraform >/dev/null 2>&1; then
+                TF_VER="1.5.7"
+                curl -fsSL "https://releases.hashicorp.com/terraform/${TF_VER}/terraform_${TF_VER}_linux_amd64.zip" -o /tmp/terraform.zip
+                unzip -o /tmp/terraform.zip -d /usr/local/bin
+                chmod +x /usr/local/bin/terraform
+                rm -f /tmp/terraform.zip
+              fi
+              aws --version
+              export AWS_REGION=${AWS_REGION}
+              export AWS_WEB_IDENTITY_TOKEN_FILE=/opt/atlassian/pipelines/agent/data/id_token
+              export AWS_ROLE_ARN=${PIPELINE_ROLE_ARN}
+              export AWS_ROLE_SESSION_NAME=BitbucketPipelines-Destroy-${BITBUCKET_BUILD_NUMBER}
+              aws sts assume-role-with-web-identity --role-arn $AWS_ROLE_ARN --role-session-name $AWS_ROLE_SESSION_NAME --web-identity-token file://$AWS_WEB_IDENTITY_TOKEN_FILE --query 'Credentials.[AccessKeyId,SecretAccessKey,SessionToken]' --output text > /tmp/credentials
+              export AWS_ACCESS_KEY_ID=$(cut -f1 /tmp/credentials)
+              export AWS_SECRET_ACCESS_KEY=$(cut -f2 /tmp/credentials)
+              export AWS_SESSION_TOKEN=$(cut -f3 /tmp/credentials)
+              terraform --version
+            - |
+              TERRAFORM_ROOT="terraform"
+              if [ -n "$TERRAFORM_ROOT" ]; then
+                echo "Changing to Terraform root directory: $TERRAFORM_ROOT"
+                cd "$TERRAFORM_ROOT"
+              fi
+            - |
+              BACKEND_KEY="$ENVIRONMENT/terraform.tfstate"
+              terraform init \
+                -backend-config="bucket=$TF_STATE_BUCKET" \
+                -backend-config="key=$BACKEND_KEY" \
+                -backend-config="region=$AWS_REGION" \
+                -input=false
+            - |
+              TFVARS_FILE=$(find . -name "*.tfvars" -type f | head -1)
+              RESOURCE_COUNT=$(terraform state list 2>/dev/null | wc -l)
+              
+              if [ "$RESOURCE_COUNT" -eq 0 ]; then
+                echo "No resources found in state"
+                exit 0
+              fi
+              
+              if [ -n "$TFVARS_FILE" ]; then
+                terraform destroy -auto-approve -var-file=$TFVARS_FILE
+              else
+                terraform destroy -auto-approve
+              fi
+          oidc: true

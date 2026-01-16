@@ -55,11 +55,11 @@ resource "aws_s3_bucket_policy" "website" {
 }
 
 resource "aws_s3_object" "website_files" {
-  for_each = fileset("${path.module}/../website/", "**/*")
+  for_each = fileset("${path.module}/website/", "**/*")
   
   bucket       = aws_s3_bucket.website.id
   key          = each.value
-  source       = "${path.module}/../website/${each.value}"
+  source       = "${path.module}/website/${each.value}"
   content_type = lookup({
     "html" = "text/html"
     "css"  = "text/css"
@@ -69,5 +69,5 @@ resource "aws_s3_object" "website_files" {
     "svg"  = "image/svg+xml"
   }, split(".", each.value)[length(split(".", each.value)) - 1], "binary/octet-stream")
   
-  etag = filemd5("${path.module}/../website/${each.value}")
+  etag = filemd5("${path.module}/website/${each.value}")
 }
